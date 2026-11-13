@@ -1,9 +1,8 @@
-name: Build YARP GUI2 (sm8850)
+name: Build gui2 lib (sm8850)
 
-# Resource handling copied from the device tree author's own workflow
-# (YuKongA/twrp_device_xiaomi_sm8850/.github/workflows/build.yml), which is the
-# configuration known to produce a working image. Only the patch step and the
-# log upload are ours.
+# Only libgui2.so is built here. The full recovery build dies on the hosted
+# runner (the job disappears with no log), and the library is all we need: the
+# rest of the image already exists and only this .so gets swapped.
 
 on:
   workflow_dispatch:
@@ -36,10 +35,14 @@ on:
         description: "lunch twrp_<target>"
         required: true
         default: "sm8850"
-      BUILD_PARTITION:
-        description: "recovery / boot / vendorboot"
+      TARGET_MODULE:
+        description: "module to build"
         required: true
-        default: "recovery"
+        default: "libgui2"
+      JOBS:
+        description: "parallel jobs"
+        required: true
+        default: "4"
       PATCH_FILE:
         description: "Patch applied to bootable/recovery"
         required: true
@@ -64,6 +67,7 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         create-symlink: true
+        max-size: 3G
 
     - name: Setup zram
       run: |
@@ -99,8 +103,6 @@ jobs:
     - name: Apply gui2 patch
       run: |
         set -x
-        # maximize-build-space remounts $GITHUB_WORKSPACE, so the checkout can
-        # be gone by now. Fall back to the raw blob of this commit.
         PATCH="$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}"
         if [ ! -f "$PATCH" ]; then
           PATCH=/tmp/gui2.patch
@@ -112,21 +114,16 @@ jobs:
           || patch -p1 -d bootable/recovery < "$PATCH"
         git -C bootable/recovery diff --stat | tail -15
 
-    - name: Build
+    - name: Build module
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        export CCACHE_DIR=.ccache
-        export CCACHE_EXEC=$(command -v ccache)
-        export CCACHE_MAXSIZE=5G
         export USE_CCACHE=1
+        export CCACHE_DIR=.ccache
         lunch twrp_${{ inputs.LUNCH_TARGET }}
-        (while true; do echo "$(date +%T) building"; free -h; df -h .; sleep 60; done) &
-        TIP_PID=$!
         set -o pipefail
-        m ${{ inputs.BUILD_PARTITION }}image 2>&1 | tee /tmp/build.log
+        m ${{ inputs.TARGET_MODULE }} -j${{ inputs.JOBS }} 2>&1 | tee /tmp/build.log
         STATUS=$?
-        kill $TIP_PID || true
         echo "m exit status: $STATUS"
         exit $STATUS
 
@@ -138,35 +135,35 @@ jobs:
         path: /tmp/build.log
         if-no-files-found: warn
 
-    - name: Collect artifact
+    - name: Collect lib
       if: ${{ !cancelled() }}
       run: |
-        P=out/target/product/${{ inputs.DEVICE_NAME }}
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
-        ls -l "$P"/*.img || true
-        find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+        P=out/target/product/${{ inputs.DEVICE_NAME }}
+        find "$P" -name "libgui2.so" -type f -print -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; || true
         cd "$GITHUB_WORKSPACE/artifacts"
-        [ -n "$(ls -A . 2>/dev/null)" ] && sha256sum * > SHA256SUMS || true
         ls -lh
+        [ -n "$(ls -A . 2>/dev/null)" ] && sha256sum * > SHA256SUMS || true
+        cat SHA256SUMS 2>/dev/null || true
 
-    - name: Upload image
-      if: ${{ !cancelled() && hashFiles('artifacts/*') != '' }}
+    - name: Upload lib
+      if: ${{ !cancelled() && hashFiles('artifacts/libgui2.so') != '' }}
       uses: actions/upload-artifact@v4
       with:
-        name: img-${{ github.run_id }}
-        path: artifacts/*
+        name: libgui2-${{ github.run_id }}
+        path: artifacts/libgui2.so
 
     - name: Release
-      if: ${{ !cancelled() && hashFiles('artifacts/*') != '' }}
+      if: ${{ !cancelled() && hashFiles('artifacts/libgui2.so') != '' }}
       uses: softprops/action-gh-release@v2
       with:
-        files: artifacts/*
-        name: YARP-gui2-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
-        tag_name: build-${{ github.run_id }}
+        files: artifacts/libgui2.so
+        name: libgui2-${{ github.run_id }}
+        tag_name: lib-${{ github.run_id }}
         body: |
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Device tree: ${{ inputs.DEVICE_TREE_URL }} (${{ inputs.DEVICE_TREE_BRANCH }})
-          Target: ${{ inputs.BUILD_PARTITION }}image
+          Module: ${{ inputs.TARGET_MODULE }}
           Patch: ${{ inputs.PATCH_FILE }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
