@@ -35,10 +35,18 @@ on:
         description: "recovery / boot / vendorboot"
         required: true
         default: "recovery"
+      JOBS:
+        description: "parallel jobs for m (lower = less RAM)"
+        required: true
+        default: "4"
       PATCH_FILE:
         description: "Patch applied to bootable/recovery"
         required: true
         default: "patches/0001-gui2-home-and-slot-swipe.patch"
+
+env:
+  BUILD_ROOT: /mnt/build
+  BUILD_LOG: /tmp/build.log
 
 jobs:
   build:
@@ -52,11 +60,14 @@ jobs:
     - name: Free up disk
       uses: rokibhasansagar/slimhub_actions@main
 
+    # Grow the build volume at /mnt/build and leave $GITHUB_WORKSPACE alone:
+    # remounting the workspace over itself is what ate the patch last time.
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
-        root-reserve-mb: 20480
-        swap-size-mb: 10240
+        root-reserve-mb: 12288
+        swap-size-mb: 16384
+        build-root-directory: /mnt/build
         remove-dotnet: 'true'
         remove-android: 'true'
         remove-haskell: 'true'
@@ -65,64 +76,84 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         create-symlink: true
-        max-size: 6G
+        max-size: 4G
 
-    - name: Setup zram
+    - name: Setup tools
       run: |
         sudo apt-get update
         sudo apt-get install -y zram-tools repo
-        sudo modprobe zram
-        sudo sed -i 's/^#PERCENT=50/PERCENT=90/' /etc/default/zramswap
-        sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap
-        sudo systemctl restart zramswap
-        zramctl
+        sudo modprobe zram || true
+        sudo sed -i 's/^#PERCENT=50/PERCENT=90/' /etc/default/zramswap || true
+        sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap || true
+        sudo systemctl restart zramswap || true
+        zramctl || true
+        df -h
+        free -h
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor }}@users.noreply.github.com"
 
     - name: Sync source
       run: |
+        mkdir -p "$BUILD_ROOT"
+        cd "$BUILD_ROOT"
         repo init -u ${{ inputs.MANIFEST_URL }} -b ${{ inputs.MANIFEST_BRANCH }} --depth=1
-        (while true; do echo "Syncing source..."; sleep 60; done) &
+        (while true; do echo "syncing $(date +%T)"; df -h "$BUILD_ROOT" | tail -1; sleep 120; done) &
         TIP_PID=$!
         repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
         kill $TIP_PID || true
+        df -h "$BUILD_ROOT"
 
     - name: Clone device tree
       run: |
+        cd "$BUILD_ROOT"
         git clone ${{ inputs.DEVICE_TREE_URL }} -b ${{ inputs.DEVICE_TREE_BRANCH }} \
           device/${{ inputs.DEVICE_PATH }}
 
     - name: Apply gui2 patch
       run: |
         set -x
-        # maximize-build-space remounts $GITHUB_WORKSPACE, which drops the
-        # checkout. Fall back to the raw blob of this exact commit.
         PATCH="$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}"
         if [ ! -f "$PATCH" ]; then
           PATCH=/tmp/gui2.patch
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/${{ inputs.PATCH_FILE }}" -o "$PATCH"
         fi
         ls -l "$PATCH"
+        cd "$BUILD_ROOT"
         git -C bootable/recovery log -1 --oneline
         git -C bootable/recovery apply --3way --verbose "$PATCH" \
           || patch -p1 -d bootable/recovery < "$PATCH"
-        git -C bootable/recovery diff --stat
+        git -C bootable/recovery diff --stat | tail -15
 
     - name: Build
       run: |
+        cd "$BUILD_ROOT"
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         export USE_CCACHE=1
+        export CCACHE_DIR=$HOME/.ccache
         lunch twrp_${{ inputs.LUNCH_TARGET }}
-        (while true; do echo "$(date +%T) building"; free -h; sleep 30; done) &
+        (while true; do echo "$(date +%T) mem:"; free -h | head -2; df -h "$BUILD_ROOT" | tail -1; sleep 60; done) &
         TIP_PID=$!
-        m ${{ inputs.BUILD_PARTITION }}image
+        set -o pipefail
+        m ${{ inputs.BUILD_PARTITION }}image -j${{ inputs.JOBS }} 2>&1 | tee "$BUILD_LOG"
+        STATUS=$?
         kill $TIP_PID || true
+        echo "m exit status: $STATUS"
+        tail -40 "$BUILD_LOG"
+        exit $STATUS
+
+    - name: Upload build log
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ github.run_id }}
+        path: /tmp/build.log
+        if-no-files-found: warn
 
     - name: Collect artifact
       if: ${{ !cancelled() }}
       run: |
-        P=out/target/product/${{ inputs.DEVICE_NAME }}
+        P="$BUILD_ROOT/out/target/product/${{ inputs.DEVICE_NAME }}"
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
         ls -l "$P"/*.img || true
         find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
@@ -130,8 +161,8 @@ jobs:
         [ -n "$(ls -A . 2>/dev/null)" ] && sha256sum * > SHA256SUMS || true
         ls -lh
 
-    - name: Upload artifact
-      if: ${{ !cancelled() }}
+    - name: Upload image
+      if: ${{ !cancelled() && hashFiles('artifacts/*') != '' }}
       uses: actions/upload-artifact@v4
       with:
         name: img-${{ github.run_id }}
@@ -147,7 +178,7 @@ jobs:
         body: |
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Device tree: ${{ inputs.DEVICE_TREE_URL }} (${{ inputs.DEVICE_TREE_BRANCH }})
-          Target: ${{ inputs.BUILD_PARTITION }}image
+          Target: ${{ inputs.BUILD_PARTITION }}image -j${{ inputs.JOBS }}
           Patch: ${{ inputs.PATCH_FILE }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
