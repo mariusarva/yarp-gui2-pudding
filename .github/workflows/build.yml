@@ -87,6 +87,10 @@ jobs:
         sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap || true
         sudo systemctl restart zramswap || true
         zramctl || true
+        # The build volume is mounted by root; hand it to the runner user.
+        sudo mkdir -p "$BUILD_ROOT"
+        sudo chown -R "$(id -u):$(id -g)" "$BUILD_ROOT"
+        touch "$BUILD_ROOT/.write-test" && rm -f "$BUILD_ROOT/.write-test"
         df -h
         free -h
         git config --global user.name "${{ github.actor }}"
@@ -94,7 +98,6 @@ jobs:
 
     - name: Sync source
       run: |
-        mkdir -p "$BUILD_ROOT"
         cd "$BUILD_ROOT"
         repo init -u ${{ inputs.MANIFEST_URL }} -b ${{ inputs.MANIFEST_BRANCH }} --depth=1
         (while true; do echo "syncing $(date +%T)"; df -h "$BUILD_ROOT" | tail -1; sleep 120; done) &
@@ -156,7 +159,7 @@ jobs:
         P="$BUILD_ROOT/out/target/product/${{ inputs.DEVICE_NAME }}"
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
         ls -l "$P"/*.img || true
-        find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
+        find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; || true
         cd "$GITHUB_WORKSPACE/artifacts"
         [ -n "$(ls -A . 2>/dev/null)" ] && sha256sum * > SHA256SUMS || true
         ls -lh
