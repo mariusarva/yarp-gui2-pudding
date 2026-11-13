@@ -1,5 +1,10 @@
 name: Build YARP GUI2 (sm8850)
 
+# Resource handling copied from the device tree author's own workflow
+# (YuKongA/twrp_device_xiaomi_sm8850/.github/workflows/build.yml), which is the
+# configuration known to produce a working image. Only the patch step and the
+# log upload are ours.
+
 on:
   workflow_dispatch:
     inputs:
@@ -35,18 +40,10 @@ on:
         description: "recovery / boot / vendorboot"
         required: true
         default: "recovery"
-      JOBS:
-        description: "parallel jobs for m (lower = less RAM)"
-        required: true
-        default: "4"
       PATCH_FILE:
         description: "Patch applied to bootable/recovery"
         required: true
         default: "patches/0001-gui2-home-and-slot-swipe.patch"
-
-env:
-  BUILD_ROOT: /mnt/build
-  BUILD_LOG: /tmp/build.log
 
 jobs:
   build:
@@ -57,71 +54,59 @@ jobs:
     - name: Check out the patch repository
       uses: actions/checkout@v4
 
-    - name: Free up disk
+    - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
 
-    # Grow the build volume at /mnt/build and leave $GITHUB_WORKSPACE alone:
-    # remounting the workspace over itself is what ate the patch last time.
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 12288
-        swap-size-mb: 16384
-        build-root-directory: /mnt/build
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
 
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         create-symlink: true
-        max-size: 4G
 
-    - name: Setup tools
+    - name: Setup zram
       run: |
         sudo apt-get update
-        sudo apt-get install -y zram-tools repo
-        sudo modprobe zram || true
-        sudo sed -i 's/^#PERCENT=50/PERCENT=90/' /etc/default/zramswap || true
-        sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap || true
-        sudo systemctl restart zramswap || true
-        zramctl || true
-        # The build volume is mounted by root; hand it to the runner user.
-        sudo mkdir -p "$BUILD_ROOT"
-        sudo chown -R "$(id -u):$(id -g)" "$BUILD_ROOT"
-        touch "$BUILD_ROOT/.write-test" && rm -f "$BUILD_ROOT/.write-test"
-        df -h
-        free -h
+        sudo apt-get install -y zram-tools
+        sudo modprobe zram
+        sudo sed -i 's/^#PERCENT=50/PERCENT=90/' /etc/default/zramswap
+        sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap
+        sudo systemctl restart zramswap
+        zramctl
+
+    - name: Setup environment
+      run: |
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt update
+        sudo apt install repo -y
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor }}@users.noreply.github.com"
 
     - name: Sync source
       run: |
-        cd "$BUILD_ROOT"
         repo init -u ${{ inputs.MANIFEST_URL }} -b ${{ inputs.MANIFEST_BRANCH }} --depth=1
-        (while true; do echo "syncing $(date +%T)"; df -h "$BUILD_ROOT" | tail -1; sleep 120; done) &
+        (while true; do echo "Syncing source..."; sleep 60; done) &
         TIP_PID=$!
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
-        kill $TIP_PID || true
-        df -h "$BUILD_ROOT"
+        repo sync
+        kill $TIP_PID && exit 0
 
-    - name: Clone device tree
+    - name: Setup device
       run: |
-        cd "$BUILD_ROOT"
         git clone ${{ inputs.DEVICE_TREE_URL }} -b ${{ inputs.DEVICE_TREE_BRANCH }} \
           device/${{ inputs.DEVICE_PATH }}
 
     - name: Apply gui2 patch
       run: |
         set -x
+        # maximize-build-space remounts $GITHUB_WORKSPACE, so the checkout can
+        # be gone by now. Fall back to the raw blob of this commit.
         PATCH="$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}"
         if [ ! -f "$PATCH" ]; then
           PATCH=/tmp/gui2.patch
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/${{ inputs.PATCH_FILE }}" -o "$PATCH"
         fi
         ls -l "$PATCH"
-        cd "$BUILD_ROOT"
         git -C bootable/recovery log -1 --oneline
         git -C bootable/recovery apply --3way --verbose "$PATCH" \
           || patch -p1 -d bootable/recovery < "$PATCH"
@@ -129,20 +114,20 @@ jobs:
 
     - name: Build
       run: |
-        cd "$BUILD_ROOT"
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
+        export CCACHE_DIR=.ccache
+        export CCACHE_EXEC=$(command -v ccache)
+        export CCACHE_MAXSIZE=5G
         export USE_CCACHE=1
-        export CCACHE_DIR=$HOME/.ccache
         lunch twrp_${{ inputs.LUNCH_TARGET }}
-        (while true; do echo "$(date +%T) mem:"; free -h | head -2; df -h "$BUILD_ROOT" | tail -1; sleep 60; done) &
+        (while true; do echo "$(date +%T) building"; free -h; df -h .; sleep 60; done) &
         TIP_PID=$!
         set -o pipefail
-        m ${{ inputs.BUILD_PARTITION }}image -j${{ inputs.JOBS }} 2>&1 | tee "$BUILD_LOG"
+        m ${{ inputs.BUILD_PARTITION }}image 2>&1 | tee /tmp/build.log
         STATUS=$?
         kill $TIP_PID || true
         echo "m exit status: $STATUS"
-        tail -40 "$BUILD_LOG"
         exit $STATUS
 
     - name: Upload build log
@@ -156,7 +141,7 @@ jobs:
     - name: Collect artifact
       if: ${{ !cancelled() }}
       run: |
-        P="$BUILD_ROOT/out/target/product/${{ inputs.DEVICE_NAME }}"
+        P=out/target/product/${{ inputs.DEVICE_NAME }}
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
         ls -l "$P"/*.img || true
         find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; || true
@@ -181,7 +166,7 @@ jobs:
         body: |
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Device tree: ${{ inputs.DEVICE_TREE_URL }} (${{ inputs.DEVICE_TREE_BRANCH }})
-          Target: ${{ inputs.BUILD_PARTITION }}image -j${{ inputs.JOBS }}
+          Target: ${{ inputs.BUILD_PARTITION }}image
           Patch: ${{ inputs.PATCH_FILE }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
