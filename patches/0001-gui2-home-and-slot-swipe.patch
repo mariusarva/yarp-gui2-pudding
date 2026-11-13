@@ -1,0 +1,309 @@
+diff --git a/gui2/gui2.cpp b/gui2/gui2.cpp
+index e308839..bf7b4c6 100644
+--- a/gui2/gui2.cpp
++++ b/gui2/gui2.cpp
+@@ -339,6 +339,11 @@ static bool& quick_brightness_dirty = page_state.quick_brightness_dirty;
+ 
+ static void hardware_slider_state_event_cb(lv_event_t* event);
+ 
++// Set when the file manager was opened straight from the home page, so Back
++// returns to the home page instead of the advanced page.
++static bool file_manager_from_home = false;
++static void reset_reboot_page_state(void);
++
+ using gui2_i18n::language_code;
+ using gui2_i18n::language_from_code;
+ 
+@@ -365,6 +370,19 @@ static void action_card_event_cb(lv_event_t* event) {
+     navigate_to(page_kind::INSTALL, nullptr, page_transition::PUSH);
+     return;
+   }
++  // Both of these live on the home page now, so they skip the action page and
++  // remember where they were opened from to make Back land there again.
++  if (definition->id == action_id::FILE_MANAGER) {
++    file_manager_from_home = true;
++    navigate_to(page_kind::FILE_MANAGER, nullptr, page_transition::PUSH);
++    return;
++  }
++  if (definition->id == action_id::REBOOT) {
++    page_state.reboot.return_request = page_router.current_request();
++    reset_reboot_page_state();
++    navigate_to(page_kind::REBOOT, nullptr, page_transition::PUSH);
++    return;
++  }
+   navigate_to(page_kind::ACTION, definition, page_transition::PUSH);
+ }
+ 
+@@ -668,9 +686,14 @@ static void navigate_back(void) {
+                 page_transition::POP);
+   } else if (page_router.current() == page_kind::FILE_MANAGER) {
+     // Back leaves the page; the first row of the list is the way up a level.
+-    navigate_to(page_kind::ACTION,
+-                &gui2_pages::action_definitions()[static_cast<int>(action_id::ADVANCED)],
+-                page_transition::POP);
++    if (file_manager_from_home) {
++      file_manager_from_home = false;
++      navigate_to(page_kind::HOME, nullptr, page_transition::POP);
++    } else {
++      navigate_to(page_kind::ACTION,
++                  &gui2_pages::action_definitions()[static_cast<int>(action_id::ADVANCED)],
++                  page_transition::POP);
++    }
+   } else if (page_router.current() == page_kind::EXPORT_LOG) {
+     navigate_to(page_kind::ACTION,
+                 &gui2_pages::action_definitions()[static_cast<int>(action_id::ADVANCED)],
+@@ -1137,6 +1160,7 @@ static void create_page_scaffold(page_kind page, bool is_home, const char* title
+   page_state.decrypt_pattern.detach();
+   page_state.backup_tabs.detach();
+   page_state.backup_confirm.detach();
++  page_state.backup_slot_confirm.detach();
+   page_state.backup_view = {};
+   page_state.decrypt_input = nullptr;
+   page_state.decrypt_keyboard = nullptr;
+@@ -4074,10 +4098,23 @@ static void backup_confirmed(void*) {
+ }
+ 
+ // backup_options: setbootslot A or B, then back to the options.
++// backup_options: pick a slot. The switch itself waits for the swipe below it.
+ static void backup_set_slot(gui2_backend::boot_slot slot) {
+   if (reboot == nullptr) return;
+   page_state.backup_name = textarea_text(page_state.backup_view.name_input);
+-  reboot->set_active_slot(slot);
++  const char* name = slot == gui2_backend::boot_slot::A ? "A" : "B";
++  // Picking the slot that is already active disarms the swipe; nothing to do.
++  page_state.backup_slot_pending = reboot->active_slot() != name;
++  page_state.backup_pending_slot = slot;
++  page_state.backup_active_tab = 1;
++  navigate_to(page_kind::BACKUP, nullptr, page_transition::REPLACE);
++}
++
++static void backup_slot_confirmed(void*) {
++  if (reboot == nullptr || !page_state.backup_slot_pending) return;
++  page_state.backup_name = textarea_text(page_state.backup_view.name_input);
++  reboot->set_active_slot(page_state.backup_pending_slot);
++  page_state.backup_slot_pending = false;
+   page_state.backup_active_tab = 1;
+   navigate_to(page_kind::BACKUP, nullptr, page_transition::REPLACE);
+ }
+@@ -4307,6 +4344,11 @@ static void show_backup_page(page_transition transition) {
+     options.slot_label = backup_slot_text.c_str();
+     options.slot_a_callback = backup_slot_a_cb;
+     options.slot_b_callback = backup_slot_b_cb;
++    if (page_state.backup_slot_pending) {
++      options.slot_confirm_text = strings().swipe_switch_slot;
++      options.slot_confirm = &page_state.backup_slot_confirm;
++      options.slot_confirm_callback = backup_slot_confirmed;
++    }
+   }
+   options.encrypt = page_state.backup_encrypt;
+   options.encrypt_target = &kBackupEncryptTarget;
+diff --git a/gui2/i18n/en.cpp b/gui2/i18n/en.cpp
+index 632b532..62ec0bd 100644
+--- a/gui2/i18n/en.cpp
++++ b/gui2/i18n/en.cpp
+@@ -67,6 +67,7 @@ extern const language_pack kEnglish = {
+   "Slot B",
+   "Swipe to Reboot",
+   "Swipe to Power Off",
++  "Swipe to Switch Slot",
+   "Unable to complete the reboot action",
+   "Console",
+   "Recovery command output",
+@@ -419,6 +420,8 @@ extern const language_pack kEnglish = {
+       { "Backup", "Create Backup", "Choose partitions and create a backup for later recovery." },
+       { "Restore", "Restore Backup", "Choose partitions to restore from an existing backup." },
+       { "Mount", "Mount Partitions", "View partition status and mount or unmount file systems." },
++      { "File Manager", "Browse storage", "Browse storage and manage files." },
++      { "Reboot", "Reboot", "Choose where to reboot." },
+       { "Advanced", "Advanced Tools",
+         "Access the terminal, file manager and other recovery tools." },
+       { "Settings", "Recovery Settings",
+diff --git a/gui2/i18n/i18n.h b/gui2/i18n/i18n.h
+index de167e4..5787fff 100644
+--- a/gui2/i18n/i18n.h
++++ b/gui2/i18n/i18n.h
+@@ -95,6 +95,7 @@ struct language_pack {
+   const char* boot_slot_b;
+   const char* swipe_reboot;
+   const char* swipe_power_off;
++  const char* swipe_switch_slot;
+   const char* reboot_failed;
+   const char* console_title;
+   const char* console_summary;
+@@ -416,7 +417,7 @@ struct language_pack {
+   const char* action_back;
+   const char* action_reboot_system;
+   const char* timezone_names[24];
+-  action_text actions[7];
++  action_text actions[9];
+   const char* progress_elapsed;
+   const char* progress_item_count;
+   const char* progress_done_count;
+diff --git a/gui2/i18n/ru.cpp b/gui2/i18n/ru.cpp
+index 57a87c7..12c8676 100644
+--- a/gui2/i18n/ru.cpp
++++ b/gui2/i18n/ru.cpp
+@@ -67,6 +67,7 @@ extern const language_pack kRussian = {
+   "Слот B",
+   "Проведите для перезагрузки",
+   "Проведите для выключения",
++  "Проведите для смены слота",
+   "Не удалось завершить действие перезагрузки",
+   "Консоль",
+   "Вывод команд восстановления",
+@@ -419,6 +420,8 @@ extern const language_pack kRussian = {
+       { "Резервная копия", "Создать резервную копию", "Выберите разделы и создайте резервную копию для последующего восстановления." },
+       { "Восстановление", "Восстановить резервную копию", "Выберите разделы для восстановления из существующей резервной копии." },
+       { "Монтирование", "Монтировать разделы", "Просмотреть статус разделов и монтировать или размонтировать файловые системы." },
++      { "Файлы", "Просмотр хранилища", "Просмотр хранилища и управление файлами." },
++      { "Перезагрузка", "Перезагрузка", "Выберите, куда перезагрузиться." },
+       { "Дополнительно", "Дополнительные инструменты",
+         "Доступ к терминалу, файловому менеджеру и другим инструментам восстановления." },
+       { "Настройки", "Настройки восстановления",
+diff --git a/gui2/i18n/zh_cn.cpp b/gui2/i18n/zh_cn.cpp
+index 1ba3901..b2d9b32 100644
+--- a/gui2/i18n/zh_cn.cpp
++++ b/gui2/i18n/zh_cn.cpp
+@@ -67,6 +67,7 @@ extern const language_pack kSimplifiedChinese = {
+   "槽位 B",
+   "滑动以重启",
+   "滑动以关机",
++  "滑动切换卡槽",
+   "无法完成重启动作",
+   "命令输出",
+   "Recovery 命令输出",
+@@ -419,6 +420,8 @@ extern const language_pack kSimplifiedChinese = {
+       { "备份", "创建备份", "选择分区并创建可供后续恢复的备份。" },
+       { "恢复", "恢复备份", "从已有备份中选择要恢复的分区。" },
+       { "挂载", "挂载分区", "查看分区状态并挂载或卸载文件系统。" },
++      { "文件", "浏览存储", "浏览存储并管理文件、刷机包与备份。" },
++      { "重启", "重启", "选择重启目标。" },
+       { "高级", "高级工具", "访问终端、文件管理和其他恢复工具。" },
+       { "设置", "恢复设置", "配置语言、显示和其他恢复环境选项。" },
+   },
+diff --git a/gui2/i18n/zh_tw.cpp b/gui2/i18n/zh_tw.cpp
+index 790c338..5059543 100644
+--- a/gui2/i18n/zh_tw.cpp
++++ b/gui2/i18n/zh_tw.cpp
+@@ -67,6 +67,7 @@ extern const language_pack kTraditionalChinese = {
+   "槽位 B",
+   "滑動以重啟",
+   "滑動以關機",
++  "滑動切換卡槽",
+   "無法完成重啟操作",
+   "命令輸出",
+   "Recovery 命令輸出",
+@@ -419,6 +420,8 @@ extern const language_pack kTraditionalChinese = {
+       { "備份", "建立備份", "選擇分割區並建立供日後還原的備份。" },
+       { "還原", "還原備份", "從現有備份中選擇要還原的分割區。" },
+       { "掛載", "掛載分割區", "查看分割區狀態並掛載或卸載檔案系統。" },
++      { "檔案管理", "瀏覽儲存", "瀏覽儲存空間並管理檔案、刷機包與備份。" },
++      { "重新啟動", "重新啟動", "選擇重新啟動目標。" },
+       { "進階", "進階工具", "存取終端機、檔案管理員和其他復原工具。" },
+       { "設定", "復原設定", "設定語言、顯示和其他復原環境選項。" },
+   },
+diff --git a/gui2/pages/action_definitions.cpp b/gui2/pages/action_definitions.cpp
+index 7c4c8ee..3c60b0f 100644
+--- a/gui2/pages/action_definitions.cpp
++++ b/gui2/pages/action_definitions.cpp
+@@ -6,11 +6,13 @@ namespace gui2_pages {
+ 
+ const action_definition* action_definitions() {
+   static const action_definition actions[] = {
++      { action_id::FILE_MANAGER, &kGui2IconFolder, 0x18C935 },
+       { action_id::INSTALL, &kGui2IconInstall, 0x347FF1 },
+       { action_id::WIPE, &kGui2IconWipe, 0xF0443E },
+       { action_id::BACKUP, &kGui2IconBackup, 0xFFAA20 },
+       { action_id::RESTORE, &kGui2IconRestore, 0x18C935 },
+       { action_id::MOUNT, &kGui2IconMount, 0x6754E8 },
++      { action_id::REBOOT, &kGui2IconPower, 0xF0443E },
+       { action_id::ADVANCED, &kGui2IconAdvanced, 0x9AA7B0 },
+       { action_id::SETTINGS, &kGui2IconSettings, 0x405A6C },
+   };
+@@ -18,7 +20,7 @@ const action_definition* action_definitions() {
+ }
+ 
+ size_t action_definition_count() {
+-  return 7;
++  return 9;
+ }
+ 
+ }  // namespace gui2_pages
+diff --git a/gui2/pages/action_definitions.h b/gui2/pages/action_definitions.h
+index a71d6cf..6b30221 100644
+--- a/gui2/pages/action_definitions.h
++++ b/gui2/pages/action_definitions.h
+@@ -13,6 +13,8 @@ enum class action_id {
+   BACKUP,
+   RESTORE,
+   MOUNT,
++  FILE_MANAGER,
++  REBOOT,
+   ADVANCED,
+   SETTINGS,
+ };
+diff --git a/gui2/pages/backup_page.cpp b/gui2/pages/backup_page.cpp
+index 17e7903..ebe615a 100644
+--- a/gui2/pages/backup_page.cpp
++++ b/gui2/pages/backup_page.cpp
+@@ -168,6 +168,20 @@ backup_page_view build_backup_page(const backup_page_options& options) {
+                                             options.slot_a_callback, strings.backup_slot_b,
+                                             options.slot_b_callback,
+                                             options.press_guard_callback);
++    // Picking a slot only arms this swipe; the switch itself happens when the
++    // knob reaches the far edge.
++    if (options.slot_confirm_text != nullptr && options.slot_confirm != nullptr &&
++        options.slot_confirm_callback != nullptr) {
++      const int slot_track = wipe_track_height();
++      view.slot_slider = options.slot_confirm->create(
++          view.options_pane, metrics, 0, 0, metrics.content_width, slot_track,
++          options.slot_confirm_text, options.slot_confirm_callback,
++          options.slot_confirm_user_data);
++      if (view.slot_slider != nullptr) {
++        lv_obj_set_width(view.slot_slider, metrics.content_width);
++        lv_obj_set_height(view.slot_slider, slot_track);
++      }
++    }
+   }
+ 
+   if (options.keyboard != nullptr) {
+diff --git a/gui2/pages/backup_page.h b/gui2/pages/backup_page.h
+index b4f3963..bd61a54 100644
+--- a/gui2/pages/backup_page.h
++++ b/gui2/pages/backup_page.h
+@@ -52,6 +52,11 @@ struct backup_page_options {
+   const char* slot_label = nullptr;
+   lv_event_cb_t slot_a_callback = nullptr;
+   lv_event_cb_t slot_b_callback = nullptr;
++  // Set once a slot is picked: the switch only happens when this is swiped.
++  const char* slot_confirm_text = nullptr;
++  gui2_components::swipe_slider* slot_confirm = nullptr;
++  void (*slot_confirm_callback)(void*) = nullptr;
++  void* slot_confirm_user_data = nullptr;
+   gui2_components::keyboard* keyboard = nullptr;
+   gui2_components::keyboard_callback key_callback = nullptr;
+   void* keyboard_user_data = nullptr;
+@@ -76,6 +81,8 @@ struct backup_page_view {
+   lv_obj_t* password_confirm_input = nullptr;
+   lv_obj_t* keyboard = nullptr;
+   lv_obj_t* slider_track = nullptr;
++  // The "switch slot" swipe, shown once a slot has been picked.
++  lv_obj_t* slot_slider = nullptr;
+ };
+ 
+ backup_page_view build_backup_page(const backup_page_options& options);
+diff --git a/gui2/pages/page_state.h b/gui2/pages/page_state.h
+index f29cf8b..1c6a58b 100644
+--- a/gui2/pages/page_state.h
++++ b/gui2/pages/page_state.h
+@@ -189,6 +189,10 @@ struct page_state {
+   gui2_components::tab_bar backup_tabs;
+   backup_page_view backup_view;
+   gui2_components::swipe_slider backup_confirm;
++  gui2_components::swipe_slider backup_slot_confirm;
++  // A slot picked on the backup options tab; applied only when swiped.
++  bool backup_slot_pending = false;
++  gui2_backend::boot_slot backup_pending_slot = gui2_backend::boot_slot::A;
+   bool backup_selected[64] = {};
+   size_t backup_target_count = 0;
+   size_t backup_active_tab = 0;
