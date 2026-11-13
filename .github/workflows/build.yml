@@ -95,9 +95,17 @@ jobs:
     - name: Apply gui2 patch
       run: |
         set -x
+        # maximize-build-space remounts $GITHUB_WORKSPACE, which drops the
+        # checkout. Fall back to the raw blob of this exact commit.
+        PATCH="$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}"
+        if [ ! -f "$PATCH" ]; then
+          PATCH=/tmp/gui2.patch
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/${{ inputs.PATCH_FILE }}" -o "$PATCH"
+        fi
+        ls -l "$PATCH"
         git -C bootable/recovery log -1 --oneline
-        git -C bootable/recovery apply --3way --verbose "$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}" \
-          || patch -p1 -d bootable/recovery < "$GITHUB_WORKSPACE/${{ inputs.PATCH_FILE }}"
+        git -C bootable/recovery apply --3way --verbose "$PATCH" \
+          || patch -p1 -d bootable/recovery < "$PATCH"
         git -C bootable/recovery diff --stat
 
     - name: Build
@@ -118,7 +126,8 @@ jobs:
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
         ls -l "$P"/*.img || true
         find "$P" -maxdepth 1 -type f -name "*.img" -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
-        cd "$GITHUB_WORKSPACE/artifacts" && sha256sum * > SHA256SUMS || true
+        cd "$GITHUB_WORKSPACE/artifacts"
+        [ -n "$(ls -A . 2>/dev/null)" ] && sha256sum * > SHA256SUMS || true
         ls -lh
 
     - name: Upload artifact
@@ -129,7 +138,7 @@ jobs:
         path: artifacts/*
 
     - name: Release
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && hashFiles('artifacts/*') != '' }}
       uses: softprops/action-gh-release@v2
       with:
         files: artifacts/*
